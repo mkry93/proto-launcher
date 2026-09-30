@@ -18,6 +18,7 @@
 #include <thread> // main loop management
 #include <unistd.h> // starting applications
 #include <vector> // flexible arrays
+#include <unordered_set>
 
 namespace fs = std::filesystem;
 using std::string, std::map, std::vector, std::ifstream, std::ofstream,
@@ -640,6 +641,8 @@ float scaleFactor = 1.0f;
 int inputHeight, rowHeight, textOffset, borderWidth, indent, commentSpace;
 XSetWindowAttributes attributes;
 vector<Application> applications;
+vector<Application> binaries; // PATH executables, only filled if enabled
+bool launchBinaries = false;
 vector<Result> results;
 map<StyleAttribute, XftFont *> fonts;
 map<StyleAttribute, XftColor> colors;
@@ -690,15 +693,41 @@ void search()
 			i++;
 		}
 		if (score > 0) {
-			results.push_back({ &app, score });
+			results.push_back(
+				{ &app, score }); // may not be necessary
 		}
 	}
-	sort(results.begin(), results.end(),
-	     [](const Result &a, const Result &b) {
-		     return b.score < a.score;
-	     });
+	// sort(results.begin(), results.end(),
+	//      [](const Result &a, const Result &b) {
+	// 	     return b.score < a.score;
+	//      });
+	// if (results.size() > 10) {
+	// 	results.resize(10); // limit to 10 results
+	// }
+
+	auto byScore = [](const Result &a, const Result &b) {
+		return b.score < a.score;
+	};
+	sort(results.begin(), results.end(), byScore);
 	if (results.size() > 10) {
-		results.resize(10); // limit to 10 results
+		results.resize(10);
+	}
+	if (results.size() < 10) { // binaries only fill leftover slots
+		const size_t first = results.size();
+		for (Application &b : binaries) {
+			const size_t m = b.keywords[0].word.find(queryi);
+			if (m == string::npos) {
+				continue;
+			}
+			// prefix matches first, then shorter names ("picom" before "picom-trans")
+			results.push_back({ &b, (m == 0 ? 100000 : 1000) -
+							(int)b.name.size() +
+							launches[b.id] });
+		}
+		sort(results.begin() + first, results.end(), byScore);
+		if (results.size() > 10) {
+			results.resize(10);
+		}
 	}
 }
 
@@ -840,6 +869,8 @@ void readConfig()
 				}
 				j++;
 			}
+		} else if (key == "binaries") {
+			launchBinaries = val == "true" || val == "1";
 		} else if (key.find("/") == string::npos) {
 			for (const auto &[type, attr] : STYLE_ATTRIBUTES) {
 				if (key == attr) {
@@ -861,6 +892,7 @@ void writeConfig()
 	outfile << "theme=" << THEMES[theme][NAME] << "\n";
 	outfile << "scale=" << scaleFactor << "\n";
 	outfile << "width=" << baseWidth << "\n";
+	outfile << "binaries=" << (launchBinaries ? "true" : "false") << "\n";
 	for (const auto &[type, attr] : STYLE_ATTRIBUTES) {
 		if (STYLE_OVERRIDE.find(type) != STYLE_OVERRIDE.end()) {
 			outfile << STYLE_ATTRIBUTES[type] << "="
@@ -935,6 +967,67 @@ vector<Application> getApplications()
 	return applications;
 }
 
+vector<Application> getBinaries()
+{
+	vector<Application> bins;
+	const char *path = getenv("PATH");
+	if (path == nullptr) {
+		return bins;
+	}
+	std::unordered_set<string> seen; // first match in PATH wins, like a shell
+	stringstream ss(path);
+	string dir;
+	while (getline(ss, dir, ':')) {
+		if (dir.empty()) {
+			continue;
+		}
+		std::error_code ec;
+		for (fs::directory_iterator it(dir, ec), end; !ec && it != end;
+		     it.increment(ec)) {
+			struct stat st;
+			const string full = it->path().string();
+			if (stat(full.c_str(), &st) != 0 ||
+			    !S_ISREG(st.st_mode) || !(st.st_mode & 0111)) {
+				continue;
+			}
+			string name = it->path().filename().string();
+			if (!seen.insert(name).second) {
+				continue;
+			}
+			Application app = {};
+			app.id = "bin/" + name;
+			app.name = name;
+			app.comment =
+				full; // shows where the binary lives in the result row
+			app.cmd = name;
+			app.keywords.push_back({ lowercase(name), 1000 });
+			bins.push_back(std::move(app));
+		}
+	}
+	return bins;
+}
+
+// drop binaries that already have a desktop entry
+void dropShadowedBinaries()
+{
+	std::unordered_set<string> taken;
+	for (const Application &a : applications) {
+		const string &c = a.cmd;
+		if (c.empty()) {
+			continue;
+		}
+		size_t b = c[0] == '"' ? 1 : 0;
+		size_t e = c.find(c[0] == '"' ? '"' : ' ', b);
+		string tok = c.substr(b, e == string::npos ? e : e - b);
+		taken.insert(tok.substr(tok.find_last_of('/') + 1));
+	}
+	binaries.erase(std::remove_if(binaries.begin(), binaries.end(),
+				      [&](const Application &b) {
+					      return taken.count(b.name) > 0;
+				      }),
+		       binaries.end());
+}
+
 void setProperty(const char *property, const char *value)
 {
 	const Atom propertyAtom = XInternAtom(display, property, False);
@@ -943,40 +1036,97 @@ void setProperty(const char *property, const char *value)
 			PropModeReplace, (unsigned char *)&valueAtom, 1);
 }
 
-void launch(Application &app)
+// void launch(Application &app)
+// {
+// 	GDesktopAppInfo *desktopApp =
+// 		g_desktop_app_info_new_from_filename(app.id.c_str());
+
+// 	if (desktopApp == nullptr) {
+// 		std::cerr << "Could not load desktop entry: " << app.id << '\n';
+// 		return;
+// 	}
+
+// 	GError *error = nullptr;
+
+// 	gboolean ok = g_app_info_launch(G_APP_INFO(desktopApp), nullptr,
+// 					nullptr, &error);
+
+// 	if (!ok) {
+// 		std::cerr
+// 			<< "Could not launch " << app.name << ": "
+// 			<< (error != nullptr ? error->message : "unknown error")
+// 			<< '\n';
+
+// 		if (error != nullptr) {
+// 			g_error_free(error);
+// 		}
+
+// 		g_object_unref(desktopApp);
+// 		return;
+// 	}
+
+// 	g_object_unref(desktopApp);
+
+// 	launches[app.id]++;
+// 	writeConfig();
+
+// 	exit(0);
+// }
+
+static bool spawnBinary(const Application &app)
+{
+	char *argv[] = { (char *)app.name.c_str(), nullptr };
+	GError *error = nullptr;
+	// SEARCH_PATH: resolves the same way the scan did. GLib closes the inherited
+	// X socket in the child; setsid detaches it (the equivalent of `picom &`
+	// that also survives the launcher exiting).
+	gboolean ok = g_spawn_async(
+		nullptr, argv, nullptr,
+		(GSpawnFlags)(G_SPAWN_SEARCH_PATH |
+			      G_SPAWN_STDIN_FROM_DEV_NULL |
+			      G_SPAWN_STDOUT_TO_DEV_NULL |
+			      G_SPAWN_STDERR_TO_DEV_NULL),
+		[](gpointer) { setsid(); }, nullptr, nullptr, &error);
+	if (!ok) {
+		std::cerr << "Could not run " << app.name << ": "
+			  << (error ? error->message : "unknown error") << '\n';
+		if (error) {
+			g_error_free(error);
+		}
+	}
+	return ok;
+}
+
+static bool spawnDesktopApp(const Application &app)
 {
 	GDesktopAppInfo *desktopApp =
 		g_desktop_app_info_new_from_filename(app.id.c_str());
-
 	if (desktopApp == nullptr) {
 		std::cerr << "Could not load desktop entry: " << app.id << '\n';
-		return;
+		return false;
 	}
-
 	GError *error = nullptr;
-
 	gboolean ok = g_app_info_launch(G_APP_INFO(desktopApp), nullptr,
 					nullptr, &error);
-
 	if (!ok) {
-		std::cerr
-			<< "Could not launch " << app.name << ": "
-			<< (error != nullptr ? error->message : "unknown error")
-			<< '\n';
-
-		if (error != nullptr) {
+		std::cerr << "Could not launch " << app.name << ": "
+			  << (error ? error->message : "unknown error") << '\n';
+		if (error) {
 			g_error_free(error);
 		}
+	}
+	g_object_unref(desktopApp);
+	return ok;
+}
 
-		g_object_unref(desktopApp);
+void launch(Application &app)
+{
+	// desktop ids are absolute paths; binary ids are "bin/<name>"
+	if (!(app.id[0] == '/' ? spawnDesktopApp(app) : spawnBinary(app))) {
 		return;
 	}
-
-	g_object_unref(desktopApp);
-
 	launches[app.id]++;
 	writeConfig();
-
 	exit(0);
 }
 
@@ -1192,9 +1342,14 @@ void onKeyPress(XEvent &event)
 
 int main()
 {
-	auto awaitApps = async(
-		getApplications); // prepare list of apps in the background
 	readConfig();
+	// auto awaitApps = async(
+	// 	getApplications); // prepare list of apps in the background
+	auto awaitApps = std::async(std::launch::async, getApplications);
+	std::future<vector<Application> > awaitBins;
+	if (launchBinaries) {
+		awaitBins = std::async(std::launch::async, getBinaries);
+	}
 
 	display = XOpenDisplay(NULL);
 	screen = DefaultScreen(display);
@@ -1258,6 +1413,11 @@ int main()
 				if (query.length() > 0) {
 					if (!applicationsLoaded) {
 						applications = awaitApps.get();
+						if (awaitBins.valid()) {
+							binaries =
+								awaitBins.get();
+							dropShadowedBinaries();
+						}
 						applicationsLoaded = true;
 					}
 					search();
