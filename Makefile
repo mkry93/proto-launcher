@@ -3,13 +3,14 @@ L_SEARCH_DIRS = -I/usr/include/X11R5  -I/usr/include/freetype2/ # extra director
 L_LIB_DIRS = -L/usr/lib/X11R5 # extra directories to look for -l flags
 L_LIBS = -lX11 -lXft -lstdc++fs -lXrandr # 3rd party libraries
 L_OPTIMIZATION = -O3 -fno-unroll-loops -fmerge-all-constants -fno-ident -ffunction-sections -fdata-sections -fno-exceptions -fno-rtti -fno-stack-protector -fomit-frame-pointer -fno-math-errno -Wl,--gc-sections -Wl,-z,norelro -Wl,--hash-style=gnu -Wl,--build-id=none -s # improve speed and reduce binary size
-
+GIO_CFLAGS := $(shell pkg-config --cflags gio-2.0 gio-unix-2.0)
+GIO_LIBS   := $(shell pkg-config --libs   gio-2.0 gio-unix-2.0)
 ifeq ($(PREFIX),)
 	PREFIX := /usr/local
 endif
 
 proto-launcher : launcher.cpp
-	g++ -o proto-launcher launcher.cpp $(L_LANG) $(L_SEARCH_DIRS) $(L_LIB_DIRS) $(L_LIBS) $(L_OPTIMIZATION)
+	g++ -o proto-launcher launcher.cpp $(GIO_CFLAGS) $(GIO_LIBS) $(L_LANG) $(L_SEARCH_DIRS) $(L_LIB_DIRS) $(L_LIBS) $(L_OPTIMIZATION)
 
 .PHONY         : clean
 clean          :
